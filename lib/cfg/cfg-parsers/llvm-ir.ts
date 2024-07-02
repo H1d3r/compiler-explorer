@@ -46,9 +46,9 @@ export class LlvmIrCfgParser extends BaseCFGParser {
 
     constructor(instructionSetInfo: BaseInstructionSetInfo) {
         super(instructionSetInfo);
-        this.functionDefinition = /^define .+ @(.+)\([^(]+$/;
-        this.labelRe = /^([\w.-]+):\s*(;.*)?$/;
-        this.labelReference = /%([\w.-]+)/g;
+        this.functionDefinition = /^define .+ @("?[^"]+"?)\(/;
+        this.labelRe = /^("?[\w$.-]+"?):\s*(;.*)?$/;
+        this.labelReference = /%("?[\w$.-]+"?)/g;
     }
 
     override filterData(asmArr: AssemblyLine[]) {
@@ -62,9 +62,10 @@ export class LlvmIrCfgParser extends BaseCFGParser {
         while (i < asmArr.length) {
             if (this.functionDefinition.test(asmArr[i].text)) {
                 const start = i;
-                while (asmArr.length > 0 && asmArr[i].text !== '}') {
+                do {
                     i++;
-                }
+                } while (i < asmArr.length && asmArr[i].text !== '}');
+
                 // start is the function define, end is the closing brace
                 result.push({
                     start,
@@ -176,13 +177,28 @@ export class LlvmIrCfgParser extends BaseCFGParser {
                     // %0 = landingpad { ptr, i32 }
                     //         catch ptr null
                     return this.concatInstructions(asmArr, lastInst - 1, lastInst + 1);
+                } else if (
+                    lastInst >= 1 &&
+                    asmArr[lastInst - 1].text.includes('callbr') &&
+                    asmArr[lastInst].text.trim().startsWith('to label')
+                ) {
+                    // Handle multi-line `callbr` like:
+                    // %2 = callbr i32 asm "mov ${1:l}, $0", "=r,!i,~{dirflag},~{fpsr},~{flags}"() #2
+                    //      to label %asm.fallthrough1 [label %err.split2]
+                    return this.concatInstructions(asmArr, lastInst - 1, lastInst + 1);
                 } else {
                     return asmArr[lastInst].text;
                 }
             })();
-            const terminator = terminatingInstruction.includes('invoke ')
-                ? 'invoke'
-                : terminatingInstruction.trim().split(' ')[0].replaceAll(',', '');
+            let terminator;
+            if (terminatingInstruction.includes('invoke ')) {
+                terminator = 'invoke';
+            } else if (terminatingInstruction.includes('callbr')) {
+                terminator = 'callbr';
+            } else {
+                terminator = terminatingInstruction.trim().split(' ')[0].replaceAll(',', '');
+            }
+
             const labels = [...terminatingInstruction.matchAll(this.labelReference)].map(m => m[1]);
             switch (terminator) {
                 case 'ret':

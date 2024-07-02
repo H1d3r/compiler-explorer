@@ -419,7 +419,8 @@ export class ClangParser extends BaseParser {
     static override async getOptions(compiler, helpArg, populate = true, isolate = false) {
         const optionFinderWithDesc = /^ {2}?(--?[\d#+,<=>A-Z[\]a-z|-]*\s?[\d+,<=>A-Z[\]a-z|-]*)\s+([A-Z].*)/;
         const optionFinderWithoutDesc = /^ {2}?(--?[\d#+,<=>[\]a-z|-]*\s?[\d+,<=>[\]a-z|-]*)/i;
-        const execOptions = isolate ?? {...compiler.getDefaultExecOptions(), createAndUseTempDir: true};
+        const execOptions = {...compiler.getDefaultExecOptions()};
+        if (isolate) execOptions.createAndUseTempDir = true;
         const result = await compiler.execCompilerCached(compiler.compiler.exe, helpArg.split(' '), execOptions);
         const options =
             result.code === 0
@@ -992,6 +993,13 @@ export class Z88dkParser extends BaseParser {
             }
         }
         return targets;
+    }
+}
+
+export class WasmtimeParser extends BaseParser {
+    static override async parse(compiler) {
+        await this.getOptions(compiler, '--help');
+        return compiler;
     }
 }
 

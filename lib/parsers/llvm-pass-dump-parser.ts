@@ -99,7 +99,8 @@ export class LlvmPassDumpParser {
 
         // Additional filters conditionally enabled by `filterDebugInfo`
         this.debugInfoFilters = [
-            /^\s+(tail\s)?call void @llvm.dbg.+$/, // dbg calls
+            /^\s+(tail\s)?call void @llvm\.dbg.+$/, // dbg calls
+            /^\s+#dbg_.+$/, // dbg records
             /^\s+DBG_.+$/, // dbg pseudo-instructions
             /^(!\d+) = (?:distinct )?!DI([A-Za-z]+)\(([^)]+?)\)/, // meta
             /^(!\d+) = (?:distinct )?!{.*}/, // meta

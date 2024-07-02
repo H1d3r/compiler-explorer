@@ -34,7 +34,9 @@ import type {
     OptPipelineOutput,
 } from '../../types/compilation/opt-pipeline-output.interfaces.js';
 import type {PreliminaryCompilerInfo} from '../../types/compiler.interfaces.js';
+import type {UnprocessedExecResult} from '../../types/execution/execution.interfaces.js';
 import type {ParseFiltersAndOutputOptions} from '../../types/features/filters.interfaces.js';
+import type {SelectedLibraryVersion} from '../../types/libraries/libraries.interfaces.js';
 import {unwrap} from '../assert.js';
 import {BaseCompiler, SimpleOutputFilenameCompiler} from '../base-compiler.js';
 import {Dex2OatPassDumpParser} from '../parsers/dex2oat-pass-dump-parser.js';
@@ -61,10 +63,16 @@ export class Dex2OatCompiler extends BaseCompiler {
     compilerFilterArgRegex: RegExp;
     fullOutputArgRegex: RegExp;
 
+    versionPrefixRegex: RegExp;
+    latestVersionRegex: RegExp;
+
     fullOutput: boolean;
 
     d8Id: string;
     artArtifactDir: string;
+    profmanPath: string;
+
+    libs: SelectedLibraryVersion[];
 
     constructor(compilerInfo: PreliminaryCompilerInfo, env) {
         super({...compilerInfo}, env);
@@ -89,6 +97,11 @@ export class Dex2OatCompiler extends BaseCompiler {
         // eslint-disable-next-line unicorn/better-regex
         this.stackMapRegex = /^\s+(StackMap\[\d+\])\s+\((.*)\).*$/;
 
+        // ART version codes in CE are in the format of AABB, where AA is the
+        // API level and BB is the number of months since the initial release.
+        this.versionPrefixRegex = /^(java|kotlin)-dex2oat-(\d\d)\d+$/;
+        this.latestVersionRegex = /^(java|kotlin)-dex2oat-latest$/;
+
         // User-provided arguments (with a default behavior if not provided).
         this.insnSetArgRegex = /^--instruction-set=.*$/;
         this.compilerFilterArgRegex = /^--compiler-filter=.*$/;
@@ -103,6 +116,12 @@ export class Dex2OatCompiler extends BaseCompiler {
 
         // The directory containing ART artifacts necessary for dex2oat to run.
         this.artArtifactDir = this.compilerProps<string>(`compiler.${this.compiler.id}.artArtifactDir`);
+
+        // The path to the `profman` binary.
+        this.profmanPath = this.compilerProps<string>(`compiler.${this.compiler.id}.profmanPath`);
+
+        // Libraries that will flow to D8Compiler and Java/KotlinCompiler.
+        this.libs = [];
     }
 
     override async runCompiler(
@@ -138,7 +157,7 @@ export class Dex2OatCompiler extends BaseCompiler {
                 {}, // backendOptions
                 inputFilename,
                 d8OutputFilename,
-                [], // libraries
+                this.libs,
                 [], // overrides
             ),
         );
@@ -180,10 +199,16 @@ export class Dex2OatCompiler extends BaseCompiler {
 
         const files = await fs.readdir(d8DirPath);
         const dexFile = files.find(f => f.endsWith('.dex'));
+        if (!dexFile) {
+            throw new Error('Generated dex file not found');
+        }
 
-        let tmpDir = d8DirPath;
-        if (this.sandboxType === 'nsjail') {
-            tmpDir = '/app';
+        const profileAndResult = await this.generateProfile(d8DirPath, dexFile);
+        if (profileAndResult && profileAndResult.result.code !== 0) {
+            return {
+                ...this.transformToCompilationResult(profileAndResult.result, inputFilename),
+                languageId: this.getCompilerResultLanguageId(filters),
+            };
         }
 
         const bootclassjars = [
@@ -194,40 +219,97 @@ export class Dex2OatCompiler extends BaseCompiler {
             'bootjars/apache-xml.jar',
         ];
 
+        let isLatest = false;
+        let versionPrefix = 0;
+        let match;
+        if (this.versionPrefixRegex.test(this.compiler.id)) {
+            match = this.compiler.id.match(this.versionPrefixRegex);
+            versionPrefix = match[2];
+        } else if (this.latestVersionRegex.test(this.compiler.id)) {
+            isLatest = true;
+        }
+
         const dex2oatOptions = [
             '--android-root=include',
             '--generate-debug-info',
             '--dex-location=/system/framework/classes.dex',
-            `--dex-file=${tmpDir}/${dexFile}`,
+            `--dex-file=${d8DirPath}/${dexFile}`,
             '--copy-dex-files=always',
-            '--runtime-arg',
-            '-Xgc:CMC',
+            ...(versionPrefix >= 34 || isLatest ? ['--runtime-arg', '-Xgc:CMC'] : []),
             '--runtime-arg',
             '-Xbootclasspath:' + bootclassjars.map(f => path.join(this.artArtifactDir, f)).join(':'),
             '--runtime-arg',
             '-Xbootclasspath-locations:/apex/com.android.art/javalib/core-oj.jar' +
-                ':/apex/com.android.art/javalib/core-libart.jar:/apex/com.android.art/javalib/okhttp.jar' +
-                ':/apex/com.android.art/javalib/bouncycastle.jar:/apex/com.android.art/javalib/apache-xml.jar',
+                ':/apex/com.android.art/javalib/core-libart.jar' +
+                ':/apex/com.android.art/javalib/okhttp.jar' +
+                ':/apex/com.android.art/javalib/bouncycastle.jar' +
+                ':/apex/com.android.art/javalib/apache-xml.jar',
             `--boot-image=${this.artArtifactDir}/app/system/framework/boot.art`,
-            `--oat-file=${tmpDir}/classes.odex`,
-            '--force-allow-oj-inlines',
-            `--dump-cfg=${tmpDir}/classes.cfg`,
+            `--oat-file=${d8DirPath}/classes.odex`,
+            `--app-image-file=${d8DirPath}/classes.art`,
+            `--dump-cfg=${d8DirPath}/classes.cfg`,
             ...userOptions,
         ];
         if (useDefaultInsnSet) {
             dex2oatOptions.push('--instruction-set=arm64');
         }
         if (useDefaultCompilerFilter) {
-            dex2oatOptions.push('--compiler-filter=speed');
+            if (profileAndResult == null) {
+                dex2oatOptions.push('--compiler-filter=speed');
+            } else {
+                dex2oatOptions.push('--compiler-filter=speed-profile');
+            }
+        }
+        if (profileAndResult != null) {
+            dex2oatOptions.push(`--profile-file=${profileAndResult.path}`);
         }
 
         execOptions.customCwd = d8DirPath;
 
         const result = await this.exec(this.compiler.exe, dex2oatOptions, execOptions);
+        if (profileAndResult != null) {
+            result.stdout = profileAndResult.result.stdout + result.stdout;
+            result.stderr = profileAndResult.result.stderr + result.stderr;
+        }
         return {
             ...this.transformToCompilationResult(result, d8OutputFilename),
             languageId: this.getCompilerResultLanguageId(filters),
         };
+    }
+
+    override getIncludeArguments(libraries: SelectedLibraryVersion[], dirPath: string): string[] {
+        this.libs = libraries;
+        return super.getIncludeArguments(libraries, dirPath);
+    }
+
+    private async generateProfile(
+        d8DirPath: string,
+        dexFile: string,
+    ): Promise<{path: string; result: UnprocessedExecResult} | null> {
+        const humanReadableFormatProfile = `${d8DirPath}/profile.prof.txt`;
+        try {
+            await fs.access(humanReadableFormatProfile);
+        } catch (e) {
+            // No profile. This is expected.
+            return null;
+        }
+
+        const execOptions = this.getDefaultExecOptions();
+        execOptions.customCwd = d8DirPath;
+        const binaryFormatProfile = `${d8DirPath}/profile.prof`;
+        const result = await this.exec(
+            this.profmanPath,
+            [
+                `--create-profile-from=${humanReadableFormatProfile}`,
+                `--apk=${d8DirPath}/${dexFile}`,
+                '--dex-location=/system/framework/classes.dex',
+                `--reference-profile-file=${binaryFormatProfile}`,
+                '--output-profile-type=app',
+            ],
+            execOptions,
+        );
+
+        return {path: binaryFormatProfile, result: result};
     }
 
     override async objdump(outputFilename, result: any, maxSize: number) {

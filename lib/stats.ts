@@ -55,6 +55,7 @@ type CompilationRecord = {
     executionParamsHash: string;
     options: string[];
     filters: Record<string, boolean>;
+    backendOptions: string[];
     bypassCache: boolean;
     libraries: string[];
     tools: string[];
@@ -69,10 +70,12 @@ export function filterCompilerOptions(args: string[]): string[] {
     return args.filter(x => capturableArg.exec(x) && !unwantedArg.test(x));
 }
 
+// note: any type on `request` is on purpose, we cannot trust ParsedRequest to be truthful to the type as it is user input
+
 export function makeSafe(
     time: Date,
     compilerId: string,
-    request: ParsedRequest,
+    request: ParsedRequest | any,
     files: FiledataPair[],
     buildMethod: string,
 ): CompilationRecord {
@@ -84,8 +87,17 @@ export function makeSafe(
         executionParamsHash: getHash(request.executeParameters),
         options: filterCompilerOptions(request.options),
         filters: Object.fromEntries(
-            Object.entries(request.filters).filter(value => typeof value[1] === 'boolean'),
+            Object.entries(request.filters)
+                .filter(value => typeof value[1] === 'boolean')
+                .map(item => [item[0].toLowerCase(), item[1]]),
         ) as Record<string, boolean>,
+        backendOptions: Object.entries(
+            Object.fromEntries(
+                Object.entries(request.backendOptions)
+                    .filter(item => item[0] !== 'overrides')
+                    .map(item => [item[0].toLowerCase(), item[1]]),
+            ),
+        ).map(item => `${item[0]}=${item[1] ? '1' : '0'}`),
         bypassCache: !!request.bypassCache,
         libraries: (request.libraries || []).map(lib => lib.id + '/' + lib.version),
         tools: (request.tools || []).map(tool => tool.id),
@@ -116,7 +128,7 @@ class StatsNoter implements IStatsNoter {
         this._flushJob = undefined;
         this._s3 = new S3Bucket(bucket, region ?? 'us-east-1');
         this._path = path ?? 'compile-stats';
-        logger.info(`Flushing stats to ${bucket}/${this._path} every ${ems.default(this._flushAfterMs)}`);
+        logger.info(`Flushing stats to ${bucket}/${this._path} every ${ems(this._flushAfterMs)}`);
     }
 
     private flush() {
@@ -163,7 +175,7 @@ export function createStatsNoter(props: PropertyGetter): IStatsNoter {
                 throw new Error(`Bad params: ${config} - expected S3(bucket, path?, region?, flushTime?)`);
             let durationMs: number | undefined;
             if (params[3]) {
-                const parsed = ems.default(params[3]);
+                const parsed = ems(params[3]);
                 if (!parsed)
                     throw new Error(
                         `Bad params: ${config} - expected S3(bucket, path?, region?, flushTime?), bad flush time`,
